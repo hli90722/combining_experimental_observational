@@ -1,0 +1,414 @@
+---
+title: "tennessee_star"
+author: "Harrison Li"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(earth)
+library(splines)
+library(quadprog)
+```
+
+```{r}
+DIR <- "/Users/harrisonli/Documents/iCloud_Documents/Stanford/Combining_RCT_and_observational_data/"
+X_NAMES <- c("gender", "race", "g1freelunch", "birthdate")
+rct_frac_list <- c(0.2, 0.4, 0.6, 0.8, 1)
+```
+
+# Helper functions
+
+```{r}
+# Returns a list of K indices dividing indices 1:n at random into
+# K folds as equally sized as possible
+get_fold_inds <- function(n, K, seed=NULL) {
+  if (K == 1) {
+    inds <- list()
+    inds[[1]] <- 1:n
+    return(inds)
+  }
+  set.seed(seed)
+  perm <- sample(n)
+  cut_ind <- cut(1:n, breaks=K, labels=FALSE)
+  return(lapply(1:K, function(k) perm[which(cut_ind==k)]))
+}
+```
+
+```{r}
+# Adds a column of 1s to mat
+add_intercept <- function(mat) {
+  mat <- as.matrix(mat)
+  return(cbind(rep(1, nrow(mat)), mat))
+}
+```
+
+```{r}
+# Estimates nuisance functions 
+# p_model estimates p(x) = Pr(S=1 | X=x) = E(S | X=x)
+# r_model estimates r(x) = Pr(Z=1 | X=x,S=0) = E(Z | X=x,S=0)
+# mean_model_sz estimates m_{sz}(x) = E(Y | X=x,S=s,Z=z) for (s,z) in {(1,0), (0,1), (0,0)}
+fit_nuisance_functions <- function(df) {
+  y_form <- formula(paste("y ~", paste(X_NAMES, collapse="+")))
+  z_form <- formula(paste("z ~", paste(X_NAMES, collapse="+")))
+  s_form <- formula(paste("s ~", paste(X_NAMES, collapse="+")))
+  
+  ## Fit nuisance function models
+  mean_model_11 <- earth(y_form, degree=2, data=df, subset=(df$s==1 & df$z==1))
+  mean_model_10 <- earth(y_form, degree=2, data=df, subset=(df$s==1 & df$z==0))
+  mean_model_01 <- earth(y_form, degree=2, data=df, subset=(df$s==0 & df$z==1))
+  mean_model_00 <- earth(y_form, degree=2, data=df, subset=(df$s==0 & df$z==0))
+  r_model <- suppressWarnings(earth(z_form, degree=2, data=df, 
+                                     glm=list(family="binomial"),
+                                     subset=(df$s==0)))
+  p_model <- suppressWarnings(earth(s_form, degree=2, data=df, 
+                                    glm=list(family="binomial")))
+  ## Add mean function estimates
+  df$m11_hat <- predict(mean_model_11, newdata=df, type="response")
+  df$m10_hat <- predict(mean_model_10, newdata=df, type="response")
+  df$m01_hat <- predict(mean_model_01, newdata=df, type="response")
+  df$m00_hat <- predict(mean_model_00, newdata=df, type="response")
+    
+  ## Fit models to estimate variance function
+  var_model_11 <- glm(formula(paste("I((y-m11_hat)^2+.Machine$double.eps) ~", paste(X_NAMES, collapse="+"))),
+                      family=gaussian(link="log"), data=df, subset=(df$s==1 & df$z==1),
+                      control=list(maxit=100))
+  var_model_10 <- glm(formula(paste("I((y-m10_hat)^2+.Machine$double.eps) ~", paste(X_NAMES, collapse="+"))),
+                      family=gaussian(link="log"), data=df, subset=(df$s==1 & df$z==0),
+                      control=list(maxit=100))
+  var_model_01 <- glm(formula(paste("I((y-m01_hat)^2+.Machine$double.eps) ~", paste(X_NAMES, collapse="+"))),
+                      family=gaussian(link="log"), data=df, subset=(df$s==0 & df$z==1),
+                      control=list(maxit=100))
+  var_model_00 <- glm(formula(paste("I((y-m00_hat)^2+.Machine$double.eps) ~", paste(X_NAMES, collapse="+"))),
+                      family=gaussian(link="log"), data=df, subset=(df$s==0 & df$z==0),
+                      control=list(maxit=100))
+  return(list(m11=mean_model_11, m10=mean_model_10, m01=mean_model_01, 
+              m00=mean_model_00, r=r_model, p=p_model,
+              v11=var_model_11, v10=var_model_10, v01=var_model_01,
+              v00=var_model_00))
+}
+```
+
+```{r}
+# Estimates theta via method of Kallus et al. (2018)
+get_theta_hat <- function(df) {
+  if (!all(c("m11_hat", "m10_hat", "m01_hat", "m00_hat", "r_hat", "p_hat") %in%
+           names(df))) {
+    stop("df needs nuisance function prediction columns")
+  }
+  model <- lm(formula(paste("I(y*(z/e-(1-z)/(1-e))-m01_hat+m00_hat)", "~",
+                            paste(X_NAMES, collapse="+"))), 
+              data=df, subset=(s==1))
+  return(model$coefficients)
+}
+```
+
+```{r}
+# Adds nuisance function predictions 
+# Estimates of [0, 1] valued functions truncated to [1/sqrt(n), 1-1/sqrt(n)]
+# for n the number of observations used for fitting
+add_nuisance_predictions <- function(df, model_list) {
+  df$m11_hat <- predict(model_list$m11, newdata=df, type="response")
+  df$m10_hat <- predict(model_list$m10, newdata=df, type="response")
+  df$m01_hat <- predict(model_list$m01, newdata=df, type="response")
+  df$m00_hat <- predict(model_list$m00, newdata=df, type="response")
+  df$r_hat <- pmax(1/sqrt(nrow(model_list[["r"]]$bx)),
+                    pmin(1-1/sqrt(nrow(model_list[["r"]]$bx)),
+                         predict(model_list$r, newdata=df, type="response")))
+  df$p_hat <- pmax(1/sqrt(nrow(model_list[["p"]]$bx)), 
+                   pmin(1-1/sqrt(nrow(model_list[["p"]]$bx)),
+                        predict(model_list$p, newdata=df, type="response")))
+  df$v11_hat <- pmax(1/sqrt(length(model_list[["v11"]]$y)),
+                     pmin(max(df$y^2),
+                     predict(model_list$v11, newdata=df, type="response")))
+  df$v10_hat <- pmax(1/sqrt(length(model_list[["v10"]]$y)),
+                     pmin(max(df$y^2),
+                     predict(model_list$v10, newdata=df, type="response")))
+  df$v01_hat <- pmax(1/sqrt(length(model_list[["v01"]]$y)),
+                     pmin(max(df$y^2),
+                     predict(model_list$v01, newdata=df, type="response")))
+  df$v00_hat <- pmax(1/sqrt(length(model_list[["v00"]]$y)),
+                     pmin(max(df$y^2),
+                     predict(model_list$v00, newdata=df, type="response")))
+  return(df)
+}
+```
+
+```{r}
+# Computes baseline estimator with sample splitting
+# Baseline estimator is efficient under no structural assumptions
+compute_baseline_estimator <- function(df) {
+  if (!all(c("m11_hat", "m10_hat", "m01_hat", "m00_hat", "p_hat", "r_hat")
+           %in% names(df))) {
+    stop("df does not have necessary columns containing nuisance estimates")
+  }
+  rho_hat <- mean(df$s)
+  exp_term <- with(df, 
+                   mean(s*(1-p_hat)/p_hat*(z*(y-m11_hat)/e - (1-z)*(y-m10_hat)/(1-e))))
+  obs_term <- with(df, mean((1-s)*(m11_hat-m10_hat)))
+  return((exp_term+obs_term)/(1-rho_hat))
+}
+```
+
+```{r}
+## Function to fit and add nuisance estimates to df
+## Nuisance estimates use K-fold cross-fitting 
+## If use_nonparam_m11_estimate is TRUE, uses nonparametric estimate of m_11(x)
+## Otherwise the fitting learns linear adjustment to the estimates of m_10, m_01, m_00
+add_nuisance_estimates <- function(df, K, seed=NULL) {
+  ## Split df into folds
+  N <- nrow(df)
+  if (K > 1) {
+    fold_inds <- get_fold_inds(N, K, seed=seed)
+    df_split <- lapply(fold_inds, function(inds) df[inds,])
+    out_of_fold_dfs <- lapply(1:K, function(k) df[do.call("c", fold_inds[-k]),])
+  } else {
+    fold_inds <- list(1:N)
+    df_split <- list(df)
+    out_of_fold_dfs <- list(df)
+  }
+  
+  ## Learn out-of-fold nuisance estimates
+  nuisance_estimates <- lapply(out_of_fold_dfs, fit_nuisance_functions)
+  
+  ## Apply nuisance estimates to in-fold data, and combine into single df
+  df_aug <- do.call("rbind",
+                    lapply(1:K, function(k) {
+                      add_nuisance_predictions(df=df_split[[k]],
+                                               model_list=nuisance_estimates[[k]])
+                    }))
+  return(df_aug)
+}
+```
+
+```{r}
+# Compute efficient estimator
+compute_eff_estimator <- function(df) {
+  
+  ## Baseline estimator
+  tau_hat <- compute_baseline_estimator(df)
+  rho_hat <- mean(df$s)
+  N <- nrow(df)
+
+  ## Learn out-of-fold best influence function estimates via regression
+  Sig <- as.vector(with(df, v11_hat+v10_hat*e/(1-e)+
+                          v01_hat*p_hat*e/((1-p_hat)*r_hat)+
+                          v00_hat*p_hat*e/((1-p_hat)*(1-r_hat))))
+  X <- df[,grep("^x", colnames(df))]
+  psi_mat <- add_intercept(X)
+  
+  gepsf1 <- as.vector(with(df, ifelse(p_hat>0, 
+                                      (1-p_hat)/p_hat, 0)*
+                            (v11_hat/e+v10_hat/(1-e))) / (1-rho_hat))
+  lam <- -1 * solve(t(psi_mat) %*% (psi_mat*(df$p_hat*df$e/Sig)) / N) %*% colMeans((gepsf1*df$p_hat*df$e/Sig)*psi_mat)
+  df$h_hat <- (gepsf1 + as.vector((psi_mat %*% lam))) / Sig
+  
+  return(tau_hat - mean(with(df,
+                             as.vector(s*z*(y-m11_hat)-s*(1-z)*e/(1-e)*(y-m10_hat)-
+                                       (1-s)*z*(y-m01_hat)*p_hat*e/((1-p_hat)*r_hat) +
+                                       (1-s)*(1-z)*(y-m00_hat)*p_hat*e/((1-p_hat)*(1-r_hat)))*h_hat)))
+}
+```
+
+```{r}
+process_star_df <- function(df) {
+  df_new <- df %>%
+    mutate(e=1805/4218,
+           race=(race == "1.0"),
+           y=y/100)
+  return(df_new)
+}
+```
+
+## Read in and process data
+
+```{r}
+rct_df <- drop_na(read_csv("rct_df_star.csv", col_types="ffffDnd")[,-1])
+obs_df_raw <- drop_na(read_csv("obs_df_star.csv", col_types="ffffDnd")[,-1])
+eval_df <- drop_na(read_csv("eval_df_star.csv", col_types="ffffDnd")[,-1])
+```
+
+```{r}
+# Store number of observations
+n_rct <- nrow(rct_df)
+n_obs <- nrow(obs_df_raw)
+n_eval <- nrow(eval_df)
+```
+
+```{r}
+# Add known propensity
+rct_df <- process_star_df(rct_df)
+obs_df <- process_star_df(obs_df_raw)
+eval_df <- process_star_df(eval_df)
+```
+
+## Compute estimand via AIPW on eval_df
+
+```{r}
+## Add dummy observations so we can add all nuisance estimates
+dummy_df <- rbind(eval_df, obs_df)
+dummy_df$s <- c(rep(1, nrow(eval_df)), rep(0, nrow(obs_df)))
+dummy_df_aug <- add_nuisance_estimates(df=dummy_df, K=5, seed=2024)
+tau <- with(dummy_df_aug,
+            mean(s*(z*(y-m11_hat)/e-(1-z)*(y-m10_hat)/(1-e)+m11_hat-m10_hat)))/mean(dummy_df_aug$s)
+```
+
+## Apply confounding to obs_df
+
+```{r}
+obs_median <- median(obs_df$y)
+med_diff <- mean(obs_df$y[obs_df$y >= obs_median]) - mean(obs_df$y[obs_df$y < obs_median])
+obs_df$y[obs_df$y >= obs_median] <- obs_df$y[obs_df$y >= obs_median] - med_diff
+```
+
+```{r}
+n_boot <- 1000
+```
+
+## Run simulations
+
+```{r}
+# tau_hat_baseline_list <- lapply(1:length(rct_frac_list), function(l) rep(NA, n_boot))
+# tau_hat_eff_list <- lapply(1:length(rct_frac_list), function(l) rep(NA, n_boot))
+# for (boot_sim in 1:n_boot) {
+#   if (boot_sim %% 10 == 0) {
+#     print(paste("Bootstrap simulation", boot_sim, "of", n_boot))
+#   }
+#   set.seed(boot_sim)
+#   obs_boot <- obs_df[sample(n_obs, size=n_obs, replace=TRUE),]
+#   for (i in 1:length(rct_frac_list)) {
+#     rct_frac <- rct_frac_list[i]
+#     rct_boot <- rct_df[sample(n_rct, size=round(rct_frac*n_rct), replace=TRUE),]
+#     df_boot <- rbind(rct_boot, obs_boot)
+#     df_boot$s <- c(rep(1, nrow(rct_boot)), rep(0, nrow(obs_boot)))
+#     df_boot_aug <- add_nuisance_estimates(df=df_boot, K=5, seed=boot_sim)
+#     tau_hat_baseline_list[[i]][boot_sim] <- compute_baseline_estimator(df_boot_aug)
+#     tau_hat_eff_list[[i]][boot_sim] <- compute_eff_estimator(df_boot_aug)
+#   }
+# }
+```
+
+```{r}
+## Combine into one object
+# tennessee_star <- list(baseline=tau_hat_baseline_list, eff=tau_hat_eff_list)
+```
+
+```{r}
+## Save
+# saveRDS(tennessee_star, paste(DIR, "tennessee_star", sep=""))
+```
+
+# Plot and print simulation results
+
+```{r}
+# Read in output
+tennessee_star <- readRDS(paste(DIR, "tennessee_star", sep=""))
+```
+
+```{r}
+# Bootstrap CI's of relative efficiencies
+# Assumes first column of estimators is the baseline
+rel_eff_boot <- function(estimators, tau, boot_seed, alpha=0.05, B=10000) {
+  set.seed(boot_seed)
+  n <- nrow(estimators)
+  bias_sq_raw <- (colMeans(estimators) - tau)^2
+  var_raw <- apply(estimators, MARGIN=2, var)
+  mse_raw <- bias_sq_raw + var_raw
+  bias_sq_star <- bias_sq_raw[1] / bias_sq_raw[-1]
+  var_star <- var_raw[1] / var_raw[-1]
+  mse_star <- mse_raw[1] / mse_raw[-1]
+  bias_sq_boot <- matrix(NA, B, ncol=ncol(estimators)-1)
+  var_boot <- matrix(NA, B, ncol=ncol(estimators)-1)
+  mse_boot <- matrix(NA, B, ncol=ncol(estimators)-1)
+  for (b in 1:B) {
+    boot_est <- estimators[sample(n, n, replace=TRUE),]
+    bias_sq_list <- (colMeans(boot_est) - tau)^2
+    var_list <- apply(boot_est, MARGIN=2, var)
+    mse_list <- bias_sq_list + var_list
+    bias_sq_boot[b,] <- bias_sq_list[1] / bias_sq_list[-1]
+    var_boot[b,] <- var_list[1] / var_list[-1]
+    mse_boot[b,] <- mse_list[1] / mse_list[-1]
+  }
+  return(list(bias_sq=rbind(bias_sq_star,
+                            2*bias_sq_star - apply(bias_sq_boot, 2, quantile, 1-alpha/2),
+                            2*bias_sq_star - apply(bias_sq_boot, 2, quantile, alpha/2)),
+              var=rbind(var_star,
+                        2*var_star - apply(var_boot, 2, quantile, 1-alpha/2),
+                        2*var_star - apply(var_boot, 2, quantile, alpha/2)),
+              mse=rbind(mse_star,
+                        2*mse_star - apply(mse_boot, 2, quantile, 1-alpha/2),
+                        2*mse_star - apply(mse_boot, 2, quantile, alpha/2))))
+}
+```
+
+```{r}
+# Print
+baseline_list <- tennessee_star$baseline
+eff_list <- tennessee_star$eff
+estimators <- lapply(1:length(rct_frac_list),
+                     function(i) cbind(baseline=baseline_list[[i]],
+                                       eff=eff_list[[i]]))
+boot_out <- lapply(estimators, rel_eff_boot, tau=tau, boot_seed=2024)
+var_mat <- t(sapply(1:length(rct_frac_list),
+                   function(i) c(baseline=var(baseline_list[[i]]),
+                                  eff=var(eff_list[[i]]))))
+bias_sq_mat <- t(sapply(1:length(rct_frac_list),
+                   function(i) c(baseline=(mean(baseline_list[[i]])-tau)^2,
+                                 eff=(mean(eff_list[[i]])-tau)^2)))
+mse_mat <- bias_sq_mat + var_mat
+print("MSE:")
+print(mse_mat)
+print("Variance:")
+print(var_mat)
+print("Squared bias:")
+print(bias_sq_mat)
+```
+
+```{r}
+## Plotting
+par(mfrow=c(1,3))
+all_names <- c("ba", "eff")
+plot_names <- c("ba", "eff")
+
+## Plot MSE, variance, and squared bias
+colors <- c("black", "orange")
+max_y <- 1.1 * max(mse_mat)
+plot(rct_frac_list, mse_mat[,1], xlab="RCT fraction", ylab="", type="b", 
+     main="MSE", lwd=2,
+     col="black", ylim=c(0, max_y))
+for (i in 2:length(all_names)) {
+  lines(rct_frac_list, mse_mat[,i], col=colors[i], type="b", lwd=2)
+}
+legend(x="topright", legend=all_names, lty="solid", col=colors)
+plot(rct_frac_list, var_mat[,1], xlab="RCT fraction", ylab="", type="b", 
+     main="Variance", lwd=2,
+     col="black", ylim=c(0, max_y))
+for (i in 2:length(all_names)) {
+  lines(rct_frac_list, var_mat[,i], col=colors[i], type="b", lwd=2)
+}
+plot(rct_frac_list, bias_sq_mat[,1], xlab="RCT fraction", ylab="", type="b", 
+     main="Squared bias", lwd=2,
+     col="black", ylim=c(0, max_y))
+for (i in 2:length(all_names)) {
+  name <- all_names[i]
+  lines(rct_frac_list, bias_sq_mat[,i], col=colors[i], type="b", lwd=2)
+}
+```
+
+```{r}
+## Print relative efficiencies
+point_ests <- t(sapply(boot_out, function(x) x$mse[1,]))
+lowers <- t(sapply(boot_out, function(x) x$mse[2,]))
+uppers <- t(sapply(boot_out, function(x) x$mse[3,]))
+
+print("Relative efficiencies [95% CI]:")
+print(round(point_ests, 2))
+print(round(lowers, 2))
+print(round(uppers, 2))
+```
+

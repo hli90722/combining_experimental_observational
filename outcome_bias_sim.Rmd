@@ -1,0 +1,1097 @@
+---
+title: "outcome_bias_sim"
+author: "Harrison Li"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(earth)
+library(tidyverse)
+library(splines)
+```
+
+```{r}
+DIR <- "/Users/harrisonli/Documents/iCloud_Documents/Stanford/Combining_RCT_and_observational_data/"
+X_NAMES <- c("x1", "x2")
+```
+
+# Helper functions
+
+```{r}
+# Returns a list of K indices dividing indices 1:n at random into
+# K folds as equally sized as possible
+get_fold_inds <- function(n, K, seed=NULL) {
+  if (K == 1) {
+    inds <- list()
+    inds[[1]] <- 1:n
+    return(inds)
+  }
+  set.seed(seed)
+  perm <- sample(n)
+  cut_ind <- cut(1:n, breaks=K, labels=FALSE)
+  return(lapply(1:K, function(k) perm[which(cut_ind==k)]))
+}
+```
+
+# Functions pertaining to the DGP
+
+```{r}
+# Vectorized evaluation of RCT propensity score e
+# X is assumed to be (coercible to) an n x 2 matrix
+# Functional form: expit(a0+a1^T %*% x)
+e_fun <- function(X, a0, a1) {
+  X <- as.matrix(X)
+  if (ncol(X) != 2) {
+    stop("X must have 2 columns")
+  }
+  return(plogis(a0 + X %*% a1))
+}
+```
+
+```{r}
+# Vectorized evaluation of mean function m(S,Z,X) = E(Y|S,Z,X)
+# X is assumed to be an n x 2 matrix, z a binary vector of length n
+# m(1,z,x) = expit(beta_0+beta_1*z+beta_2^T*x+z*beta_3^T*x+beta_4*x1*x2+
+#   +beta_5*z*x1*x2)
+# m(0,z,x) is then derived using Bayes' rule, LOTP, and the selection 
+# probabilities p0, p1
+outcome_mean <- function(X, z, beta0, beta1, beta2, beta3, beta4, beta5,
+                         s=1, p0=1, p1=1) {
+  if (ncol(X) != 2) {
+    stop("X must have 2 columns")
+  } else if (nrow(X) != length(z)) {
+    stop("Number of rows in X must be the same as the length of z")
+  }
+  x1x2 <- apply(X, MARGIN=1, FUN=prod)
+  eta <- beta0+beta1*z+X %*% beta2+z * (X %*% beta3)+beta4*x1x2+beta5*z*x1x2
+  raw_mean <- plogis(eta)
+  return(s*raw_mean+(1-s)*p1*raw_mean/(p1*raw_mean+p0*(1-raw_mean)))
+}
+```
+
+```{r}
+# Vectorized evaluation of variance function V(S,Z,X) = Var(Y|S,Z,X)
+# X is assumed to be an n x 2 matrix, z a binary vector of length n
+outcome_var <- function(X, z, beta0, beta1, beta2, beta3, beta4, beta5, 
+                        s=1, p0=1, p1=1) {
+  p <- outcome_mean(X, z, beta0, beta1, beta2, beta3, beta4, beta5,
+                    s=1, p0=1, p1=1)
+  return(p*(1-p))
+}
+```
+
+```{r}
+# Vectorized evaluation of CATE
+cate_fun <- function(X, beta0, beta1, beta2, beta3, beta4, beta5, alpha) {
+  return(outcome_mean(X=X, z=rep(1, nrow(X)), beta0=beta0, beta1=beta1, 
+                      beta2=beta2, beta3=beta3, beta4=beta4, beta5=beta5) - 
+         outcome_mean(X=X, z=rep(0, nrow(X)), beta0=beta0, beta1=beta1, 
+                      beta2=beta2, beta3=beta3, beta4=beta4, beta5=beta5))
+}
+```
+
+```{r}
+# Probability of inclusion in the observational dataset given x
+selection_prob_given_X <- function(X, a0, a1, beta0, beta1, beta2, beta3, beta4, 
+                                   beta5, p0, p1) {
+  mean_y_given_x <- outcome_mean(X=X, z=rep(0, nrow(X)), beta0=beta0, 
+                                 beta1=beta1, beta2=beta2, beta3=beta3,
+                                 beta4=beta4, beta5=beta5) * 
+                    (1-e_fun(X, a0, a1)) +
+                    outcome_mean(X=X, z=rep(1, nrow(X)), beta0=beta0, 
+                                 beta1=beta1, beta2=beta2, beta3=beta3,
+                                 beta4=beta4, beta5=beta5) * 
+                    e_fun(X, a0, a1)
+  return(p0*(1-mean_y_given_x) + p1*mean_y_given_x)
+}
+```
+
+```{r}
+# Function to compute X density in experimental dataset
+# Returns Bern(0.5)^2 PMF if x_type="discrete," else U(-1,1)^2 density
+get_X_density_rct <- function(X, x_type) {
+  if (ncol(X) != 2) {
+    stop("X must have 2 columns")
+  }
+  if (x_type=="discrete") {
+    return(rep(1/4, nrow(X)))
+  } else if (x_type=="continuous") {
+    return(dunif(X[,1], min=-1, max=1) * dunif(X[,2], min=-1, max=1))
+  } else {
+    stop("x_type must be 'discrete' or 'continuous'")
+  }
+}
+```
+
+```{r}
+# Marginal probability of inclusion in the observational dataset
+# Marginalizes selection_prob_given_X via numerical integration
+marginal_selection_prob <- function(x_type, a0, a1, beta0, beta1, beta2, 
+                                    beta3, beta4, beta5, p0, p1) {
+  sel_prob_fun <- function(X) {
+    selection_prob_given_X(X=X, a0=a0, a1=a1, beta0=beta0, beta1=beta1, 
+                           beta2=beta2, beta3=beta3, beta4=beta4, 
+                           beta5=beta5, p0=p0, p1=p1)
+  }
+  if (x_type == "discrete") {
+    X_disc <- matrix(c(0,0,0,1,1,0,1,1), ncol=2, byrow=TRUE)
+    return(mean(sel_prob_fun(X_disc)))
+  } else if (x_type == "continuous") {
+    ## Continuous
+    select_prob_given_x <- function(x2) {
+      sapply(x2, function(x) integrate(function(x1) {
+          X_input <- cbind(x1, rep(x, length(x1)))
+          return(dunif(x1, min=-1, max=1)*dunif(x, min=-1, max=1)
+                 *sel_prob_fun(X_input))
+        }, lower=-1, upper=1, rel.tol=.Machine$double.eps^0.5)$value)
+    }
+    return(integrate(select_prob_given_x, lower=-1, upper=1, 
+                     rel.tol=.Machine$double.eps^0.5)$value)    
+  } else {
+    stop("x_type must be 'discrete' or 'continuous'")
+  }
+}
+```
+
+```{r}
+# Function to compute X density marginalized over merged datasets
+get_X_density <- function(X, rho, x_type, a0, a1, beta0, beta1, beta2, 
+                          beta3, beta4, beta5, p0, p1) {
+  if (ncol(X) != 2) {
+    stop("X must have 2 columns")
+  }
+  selection_prob_X <- selection_prob_given_X(X=X, a0=a0, a1=a1, beta0=beta0, 
+                                             beta1=beta1, beta2=beta2, 
+                                             beta3=beta3, beta4=beta4, 
+                                             beta5=beta5, p0=p0, p1=p1)
+  selection_prob <- marginal_selection_prob(x_type=x_type, a0=a0, a1=a1, 
+                                            beta0=beta0, beta1=beta1, 
+                                            beta2=beta2, beta3=beta3, 
+                                            beta4=beta4, beta5=beta5,
+                                            p0=p0, p1=p1)
+  obs_adj <- selection_prob_X / selection_prob
+  f_X <- get_X_density_rct(X, x_type)
+  return(f_X * (rho + (1-rho)*selection_prob_X/selection_prob))
+}
+```
+
+```{r}
+# Vectorized evaluation of observational propensity score r
+r_fun <- function(X, a0, a1, beta0, beta1, beta2, beta3, beta4, beta5, p0, 
+                  p1) {
+  mean_y_given_x_trt <- outcome_mean(X=X, z=rep(1, nrow(X)), beta0=beta0, 
+                                     beta1=beta1, beta2=beta2, beta3=beta3,
+                                     beta4=beta4, beta5=beta5)
+  p_selected_given_x_trt <- p1*mean_y_given_x_trt + p0*(1-mean_y_given_x_trt)
+  return(p_selected_given_x_trt * e_fun(X=X, a0=a0, a1=a1) / 
+         selection_prob_given_X(X=X, a0=a0, a1=a1, beta0=beta0, beta1=beta1, 
+                                beta2=beta2, beta3=beta3, beta4=beta4, 
+                                beta5=beta5, p0=p0, p1=p1))
+}
+```
+
+```{r}
+# Vectorized evaluation of selection probability function p
+p_fun <- function(X, rho, x_type, a0, a1, beta0, beta1, beta2, beta3, 
+                  beta4, beta5, p0, p1) {
+  # Evaluate density of X over combined dataset
+  x_marg <- get_X_density(X=X, rho=rho, x_type=x_type, a0=a0, a1=a1, 
+                          beta0=beta0, beta1=beta1, beta2=beta2, beta3=beta3,
+                          beta4=beta4, beta5=beta5, p0=p0, p1=p1)
+  x_rct <- get_X_density_rct(X=X, x_type=x_type)
+  return(x_rct*rho/x_marg)
+}
+```
+
+# Functions to generate simulated data
+
+```{r}
+# Perform selection in observational dataset
+# Return indices of outcomes in y that are kept according to the following:
+# - Independently keep each zero outcome in y with probability p0 
+# - Independently keep each one outcome with probability p1
+filter_outcomes <- function(y, p0, p1) {
+  n <- length(y)
+  f0 <- rbinom(n=n, size=1, prob=p0)
+  f1 <- rbinom(n=n, size=1, prob=p1)
+  return(which((y==0 & f0) | (y==1 & f1)))
+}
+```
+
+```{r}
+# Generates n observations from DGP
+# x_type is either "discrete" or "continuous"
+# Returns n x 4 data frame with column names x1, x2, z, y
+gen_data <- function(x_type, n, a0, a1, beta0, beta1, beta2, beta3, beta4, 
+                     beta5) {
+  if (x_type == "discrete") {
+    X <- matrix(rbinom(n=2*n, size=1, prob=0.5), ncol=2)
+  } else if (x_type == "continuous") {
+    X <- matrix(runif(n=2*n, min=-1, max=1), ncol=2)
+  }
+  z <- rbinom(n=n, size=1, prob=e_fun(X, a0, a1))
+  y <- rbinom(n=n, size=1, prob=outcome_mean(X, z, beta0, beta1, beta2, beta3, 
+                                             beta4, beta5))
+  return(data.frame(x1=X[,1], x2=X[,2], z=z, y=y))
+}
+```
+
+# Functions to estimate nuisance functions
+
+```{r}
+# Estimates nuisance functions 
+# Discrete x: stratify on x and use +1/+2 estimator to avoid 0's and 1's
+# Continuous x: MARS with interaction
+# p_hat estimates p(x) = Pr(S=1 | X=x) = E(S | X=x)
+# r_hat estimates r(x) = Pr(Z=1 | X=x,S=0) = E(Z | X=x,S=0)
+# msz_hat estimates msz(x) = E(Y | X=x,S=s,Z=z) for s, z in {0, 1}
+# dsz_hat estimates dsz(x) via plug-in based on msz_hat
+# df must include columns x1, x2, z, y, s
+# Discrete x: returns table consisting of estimates for each x
+# Continuous x: returns list of models
+fit_nuisance_estimates <- function(df, x_type) {
+  X <- df[,X_NAMES]
+  discrete <- !(nrow(X) == nrow(unique(X))) # check whether X discrete
+  if (x_type=="discrete") {
+    nuisance_estimates <- df %>%
+      group_by(x1, x2) %>%
+      summarise(tot=n(),
+                p_hat=(1+sum(s))/(2+tot),
+                r_hat=(1+sum(z*(1-s)))/(2+sum(1-s)),
+                m11_hat=(1+sum(y*s*z))/(2+sum(s*z)),
+                m10_hat=(1+sum(y*s*(1-z)))/(2+sum(s*(1-z))),
+                m01_hat=(1+sum(y*(1-s)*z))/(2+sum((1-s)*z)),
+                m00_hat=(1+sum(y*(1-s)*(1-z)))/(2+sum((1-s)*(1-z))),
+                v11_hat=m11_hat*(1-m11_hat),
+                v10_hat=m10_hat*(1-m10_hat),
+                v01_hat=m01_hat*(1-m01_hat),
+                v00_hat=m00_hat*(1-m00_hat),
+                .groups="drop")
+    return(nuisance_estimates)
+  } else if (x_type=="continuous") {
+    
+    ## Fit nuisance models with logistic MARS
+    mean_model_11 <- suppressWarnings(earth(y~x1+x2, degree=2, data=df,
+                           glm=list(family="binomial"),
+                           subset=(df$s==1 & df$z==1)))
+    mean_model_10 <- suppressWarnings(earth(y~x1+x2, degree=2, data=df,
+                           glm=list(family="binomial"),
+                           subset=(df$s==1 & df$z==0)))
+    mean_model_01 <- suppressWarnings(earth(y~x1+x2, degree=2, data=df,
+                           glm=list(family="binomial"),
+                           subset=(df$s==0 & df$z==1)))
+    mean_model_00 <- suppressWarnings(earth(y~x1+x2, degree=2, data=df,
+                           glm=list(family="binomial"),
+                           subset=(df$s==0 & df$z==0)))
+    r_model <- suppressWarnings(earth(z~x1+x2, degree=2, data=df, 
+                                       glm=list(family="binomial"),
+                                       subset=(df$s==0)))
+    p_model <- suppressWarnings(earth(s~x1+x2, degree=2, data=df, 
+                                      glm=list(family="binomial")))
+    return(list(m11=mean_model_11, m10=mean_model_10, m01=mean_model_01,
+                m00=mean_model_00, r=r_model, p=p_model))
+  } else {
+    stop("x_type must be 'discrete' or 'continuous'")
+  }
+}
+```
+
+```{r}
+# Adds nuisance function predictions to df. 
+# model_list is a list of nuisance models returned from 
+# get_nuisance_estimates() (only relevant in the continuous case)
+# In continuous case,
+# estimates of [0, 1] valued functions truncated to [1/sqrt(n), 1-1/sqrt(n)]
+# for n the number of observations used for fitting
+add_nuisance_predictions <- function(df, model_list) {
+  df$m11_hat <- pmax(1/sqrt(nrow(model_list[["m11"]]$bx)),
+                    pmin(1-1/sqrt(nrow(model_list[["m11"]]$bx)),
+                          predict(model_list$m11, newdata=df, type="response")))
+  df$m10_hat <- pmax(1/sqrt(nrow(model_list[["m10"]]$bx)),
+                    pmin(1-1/sqrt(nrow(model_list[["m10"]]$bx)),
+                          predict(model_list$m10, newdata=df, type="response")))
+  df$m01_hat <- pmax(1/sqrt(nrow(model_list[["m01"]]$bx)),
+                    pmin(1-1/sqrt(nrow(model_list[["m01"]]$bx)),
+                          predict(model_list$m01, newdata=df, type="response")))
+  df$m00_hat <- pmax(1/sqrt(nrow(model_list[["m00"]]$bx)),
+                    pmin(1-1/sqrt(nrow(model_list[["m00"]]$bx)),
+                        predict(model_list$m00, newdata=df, type="response")))
+  df$r_hat <- pmax(1/sqrt(nrow(model_list[["r"]]$bx)),
+                    pmin(1-1/sqrt(nrow(model_list[["r"]]$bx)),
+                         predict(model_list$r, newdata=df, type="response")))
+  df$p_hat <- pmax(1/sqrt(nrow(model_list[["p"]]$bx)),
+                    pmin(1-1/sqrt(nrow(model_list[["p"]]$bx)),
+                        predict(model_list$p, newdata=df, type="response")))
+  df$v11_hat <- df$m11_hat * (1-df$m11_hat)
+  df$v10_hat <- df$m10_hat * (1-df$m10_hat)
+  df$v01_hat <- df$m01_hat * (1-df$m01_hat)
+  df$v00_hat <- df$m00_hat * (1-df$m00_hat)
+  return(df)
+}
+```
+
+```{r}
+# Adds true nuisance function evaluations to df (for oracle estimators)
+add_true_nuisance_functions <- function(df, x_type, p0, p1, a0, a1, beta0,
+                                        beta1, beta2, beta3, beta4, beta5) {
+  X <- as.matrix(df[,X_NAMES])
+  rho <- mean(df$s)
+  
+  df$m11_hat <- outcome_mean(X=X, z=rep(1, nrow(X)), beta0=beta0, beta1=beta1, 
+                             beta2=beta2, beta3=beta3, beta4=beta4, beta5=beta5,
+                             s=1, p0=p0, p1=p1)
+  df$m10_hat <- outcome_mean(X=X, z=rep(0, nrow(X)), beta0=beta0, beta1=beta1, 
+                             beta2=beta2, beta3=beta3, beta4=beta4, beta5=beta5,
+                             s=1, p0=p0, p1=p1)
+  df$m01_hat <- outcome_mean(X=X, z=rep(1, nrow(X)), beta0=beta0, beta1=beta1, 
+                             beta2=beta2, beta3=beta3, beta4=beta4, beta5=beta5,
+                             s=0, p0=p0, p1=p1)
+  df$p_hat <- p_fun(X=X, rho=rho, x_type=x_type, a0=a0, a1=a1, beta0=beta0, 
+                    beta1=beta1, beta2=beta2, beta3=beta3, beta4=beta4, 
+                    beta5=beta5, p0=p0, p1=p1)
+  df$r_hat <- r_fun(X=X, a0=a0, a1=a1, beta0=beta0, beta1=beta1, beta2=beta2,
+                      beta3=beta3, beta4=beta4, beta5=beta5, p0=p0, p1=p1)
+  df$m00_hat <- outcome_mean(X=X, z=rep(0, nrow(X)), beta0=beta0, beta1=beta1, 
+                             beta2=beta2, beta3=beta3, beta4=beta4, beta5=beta5,
+                             s=0, p0=p0, p1=p1)
+  df$v11_hat <- df$m11_hat * (1-df$m11_hat)
+  df$v10_hat <- df$m10_hat * (1-df$m10_hat)
+  df$v01_hat <- df$m01_hat * (1-df$m01_hat)
+  df$v00_hat <- df$m00_hat * (1-df$m00_hat)
+  return(df)  
+}
+```
+
+# Functions to compute estimators
+
+```{r}
+## Function to fit and add nuisance estimates to df
+## Nuisance estimates use K-fold cross-fitting 
+add_nuisance_estimates <- function(df, x_type, K, seed=NULL) {
+  
+  ## Split df into folds
+  N <- nrow(df)
+  if (K > 1) {
+    fold_inds <- get_fold_inds(N, K, seed=seed)
+    df_split <- lapply(fold_inds, function(inds) df[inds,])
+    out_of_fold_dfs <- lapply(1:K, function(k) df[do.call("c", fold_inds[-k]),])
+  } else {
+    fold_inds <- list(1:N)
+    df_split <- list(df)
+    out_of_fold_dfs <- list(df)
+  }
+  
+  ## Learn out-of-fold nuisance estimates
+  nuisance_estimates <- lapply(out_of_fold_dfs, fit_nuisance_estimates, 
+                               x_type=x_type)
+  
+  ## Apply nuisance estimates to in-fold data, and combine into single df
+  if (x_type=="discrete") {
+    ## Discrete case
+    df_list <- lapply(1:K, function(k) left_join(df[fold_inds[[k]],],
+                                                   nuisance_estimates[[k]],
+                                                   by=X_NAMES))
+  } else if (x_type=="continuous") {
+    ## Continuous case
+    df_list <- lapply(1:K, function(k) {
+      add_nuisance_predictions(df=df[fold_inds[[k]],],
+                               model_list=nuisance_estimates[[k]])
+    })
+  } else {
+    stop("x_type must be 'discrete' or 'continuous'")
+  }
+  
+  ## Combine into single dataframe
+  df_aug <- do.call("rbind", df_list)
+  return(df_aug)
+}
+```
+
+```{r}
+# Computes baseline estimators with sample splitting
+# Baseline estimators are efficient in the absence of structural assumptions
+# df must contain columns y, s, z, x1, x2 
+compute_baseline_estimators <- function(df) {
+  if (!all(c("y", "s", "z", "x1", "x2") %in% names(df))) {
+    stop("df must contain columns 'y', 's', 'z', 'x1', 'x2'")
+  }
+  N <- nrow(df)
+  
+  ## Compute estimator
+  rho_hat <- mean(df$s)
+  
+  ## rct
+  reg <- with(df, mean(s*(m11_hat-m10_hat))) / rho_hat
+  adj <- with(df, mean(s*(z*(y-m11_hat)/e - (1-z)*(y-m10_hat)/(1-e)))) / rho_hat
+  tau_hat_rct <- reg+adj
+
+  ## obs
+  rct_term <- with(df, 
+                   mean(s*(1-p_hat)/p_hat*(z*(y-m11_hat)/e - 
+                                            (1-z)*(y-m10_hat)/(1-e))))
+  obs_term <- with(df, mean((1-s)*(m11_hat-m10_hat)))
+  tau_hat_obs <- (rct_term+obs_term)/(1-rho_hat)
+  
+  ## tgt 
+  reg <- with(df, mean(m11_hat-m10_hat))
+  adj <- with(df, mean(s*(z*(y-m11_hat)/e - (1-z)*(y-m10_hat)/(1-e))/p_hat))
+  tau_hat_tgt <- reg+adj
+  
+  return(c(rct=tau_hat_rct, obs=tau_hat_obs, tgt=tau_hat_tgt))
+}
+```
+
+```{r}
+# Estimates control variates
+# Adapted from https://github.com/serenalwang/multisource-causal-public/blob/
+#   main/data_sampler.py
+# If x_in is NULL, returns list of OR difference estimates for each x in df
+# Otherwise uses mean function to estimate difference in log OR directly
+get_CV_estimates <- function(df, x_in, seed=NULL){
+  if (!is.null(x_in)) {
+    model_list <- fit_nuisance_estimates(df, x_type="continuous")
+    
+    rct_trunc <- abs(min(qlogis(1/sqrt(nrow(model_list[["m11"]]$bx))), qlogis(1/sqrt(nrow(model_list[["m10"]]$bx)))))
+    log_OR_rct_pred <- predict(model_list$m11, newdata=x_in, type="link") - 
+                         predict(model_list$m10, newdata=x_in, type="link")
+    log_OR_rct <- pmin(rct_trunc, pmax(log_OR_rct_pred, -rct_trunc))
+    
+    obs_trunc <- abs(min(qlogis(1/sqrt(nrow(model_list[["m01"]]$bx))), qlogis(1/sqrt(nrow(model_list[["m00"]]$bx)))))
+    log_OR_obs_pred <- predict(model_list$m01, newdata=x_in, type="link") - 
+      predict(model_list$m00, newdata=x_in, type="link")
+    log_OR_obs <- pmin(obs_trunc, pmax(log_OR_obs_pred, -obs_trunc))
+    return(mean(log_OR_rct-log_OR_obs))
+  } else {
+    CV_estimates <- df %>%
+      group_by(x1, x2) %>%
+      summarise(m11_hat=(1+sum(y*s*z))/(2+sum(s*z)),
+                m10_hat=(1+sum(y*s*(1-z)))/(2+sum(s*(1-z))),
+                m01_hat=(1+sum(y*(1-s)*z))/(2+sum((1-s)*z)),
+                m00_hat=(1+sum(y*(1-s)*(1-z)))/(2+sum((1-s)*(1-z))),
+                odds_11=m11_hat/(1-m11_hat),
+                odds_10=m10_hat/(1-m10_hat),
+                odds_01=m01_hat/(1-m01_hat),
+                odds_00=m00_hat/(1-m00_hat),
+                CV_estimates=odds_11/odds_10-odds_01/odds_00,
+                .groups="drop") %>%
+      pull(CV_estimates)
+    return(CV_estimates)
+  }
+}
+```
+
+```{r}
+# Computes CV adjustment coefficient by bootstrapping df n_replicates times 
+get_CV_adj_boot <- function(df, n_replicates, K, x_type, x_in, seed=NULL) {
+  
+  ## Ignore x_in if x_type is "discrete"
+  if (x_type=="discrete") {
+    x_in <- NULL
+    len_CV <- nrow(unique(df[,X_NAMES]))
+  } else {
+    len_CV <- 1
+  }
+
+  ## Estimate variance components of control variates via bootstrap
+  n <- nrow(df)
+  boot_estimates_rct <- matrix(NA, nrow=n_replicates, ncol=1+len_CV)
+  boot_estimates_obs <- matrix(NA, nrow=n_replicates, ncol=1+len_CV)
+  boot_estimates_tgt <- matrix(NA, nrow=n_replicates, ncol=1+len_CV)
+  for (r in 1:n_replicates) {
+    set.seed(seed)
+    ## Set new seed
+    if (!is.null(seed)) {
+      seed <- seed + 1
+    }
+    
+    ## Bootstrap rct_data and obs_data
+    boot_ind <- sample(x=n, size=n, replace=TRUE)
+    df_boot <- df[boot_ind,]
+    
+    ## Estimate tau
+    if (!all(c("m11_hat", "m10_hat") %in% names(df_boot))) {
+      df_boot <- add_nuisance_estimates(df=df_boot, x_type=x_type, K=K, 
+                                        seed=seed)
+    }
+
+    baseline_boot <- compute_baseline_estimators(df_boot)
+    
+    ## Estimate CV's
+    CV_estimates_boot <- get_CV_estimates(df=df_boot, x_in=x_in, seed=seed)
+    boot_estimates_rct[r,] <- c(baseline_boot[["rct"]], CV_estimates_boot)
+    boot_estimates_obs[r,] <- c(baseline_boot[["obs"]], CV_estimates_boot)
+    boot_estimates_tgt[r,] <- c(baseline_boot[["tgt"]], CV_estimates_boot)
+  }
+  Sigma_rct <- cov(boot_estimates_rct)
+  Sigma_obs <- cov(boot_estimates_obs)
+  Sigma_tgt <- cov(boot_estimates_tgt)
+  opt_adj_mat <- rbind(Sigma_rct[1,-1] %*% solve(Sigma_rct[-1,-1]),
+                       Sigma_obs[1,-1] %*% solve(Sigma_obs[-1,-1]),
+                       Sigma_tgt[1,-1] %*% solve(Sigma_tgt[-1,-1]))
+  rownames(opt_adj_mat) <- c("rct", "obs", "tgt")
+  
+  return(opt_adj_mat)
+}
+```
+
+```{r}
+# Compute efficient estimators
+compute_eff_estimators <- function(df) {
+  
+  ## Baseline estimator
+  tau_hat <- compute_baseline_estimators(df)
+  rho_hat <- mean(df$s)
+  
+  # Enforce odds ratio transportability in estimates
+  df$m11_hat <- with(df, plogis(qlogis(m10_hat) + qlogis(m01_hat) -
+                                  qlogis(m00_hat)))
+  df$v11_hat <- df$m11_hat * (1-df$m11_hat)
+
+  Sig <- as.vector(with(df, 1/v11_hat+e/(v10_hat*(1-e))+
+                          p_hat*e/(v01_hat*(1-p_hat)*r_hat)+
+                          p_hat*e/(v00_hat*(1-p_hat)*(1-r_hat))))
+  gepsf1_rct <- as.vector(with(df, (p_hat>0)*(1/e+1/(1-e))) / rho_hat)
+  gepsf1_obs <- as.vector(with(df, 
+                               ifelse(p_hat>0, (1-p_hat)/p_hat, 0) *
+                                 (1/e+1/(1-e))) / (1-rho_hat))
+  gepsf1_tgt <- as.vector(with(df, ifelse(p_hat>0, 
+                                          (1/e+1/(1-e))/p_hat, 0)))
+  df$h_hat_rct <- gepsf1_rct / Sig
+  df$h_hat_obs <- gepsf1_obs / Sig
+  df$h_hat_tgt <- gepsf1_tgt/ Sig
+  
+  return(list(rct=tau_hat[["rct"]] - 
+                mean(with(df,
+                   as.vector(s*z*(y-m11_hat)/v11_hat-
+                             s*(1-z)*e/(1-e)*(y-m10_hat)/v10_hat-
+                             (1-s)*z*(y-m01_hat)*p_hat*e/((1-p_hat)*r_hat*v01_hat) +
+                             (1-s)*(1-z)*(y-m00_hat)*p_hat*e/((1-p_hat)*(1-r_hat)*v00_hat))*h_hat_rct)),
+              obs=tau_hat[["obs"]] - 
+                mean(with(df,
+                   as.vector(s*z*(y-m11_hat)/v11_hat-
+                             s*(1-z)*e/(1-e)*(y-m10_hat)/v10_hat-
+                             (1-s)*z*(y-m01_hat)*p_hat*e/((1-p_hat)*r_hat*v01_hat) +
+                             (1-s)*(1-z)*(y-m00_hat)*p_hat*e/((1-p_hat)*(1-r_hat)*v00_hat))*h_hat_obs)),
+              tgt=tau_hat[["tgt"]] - 
+                 mean(with(df,
+                   as.vector(s*z*(y-m11_hat)/v11_hat-
+                             s*(1-z)*e/(1-e)*(y-m10_hat)/v10_hat-
+                             (1-s)*z*(y-m01_hat)*p_hat*e/((1-p_hat)*r_hat*v01_hat) +
+                             (1-s)*(1-z)*(y-m00_hat)*p_hat*e/((1-p_hat)*(1-r_hat)*v00_hat))*h_hat_tgt))))
+  
+  
+  den <- with(df, v11_hat*d11_hat^2*(1-p_hat)*(1-r_hat)/(p_hat*e)) +
+    with(df, v10_hat*d10_hat^2*(1-p_hat)*(1-r_hat)/(p_hat*(1-e))) +
+    with(df, v01_hat*d01_hat^2*(1-r_hat)/r_hat) +
+    with(df, v00_hat)
+  rat <- with(df, (v10_hat*d10_hat/(1-e) - v11_hat*d11_hat/e)) / den
+  df$h_hat_rct <- rat / rho_hat
+  df$h_hat_obs <- rat * with(df, (1-p_hat)/p_hat) / (1-rho_hat)
+  df$h_hat_tgt <- rat / df$p_hat
+  
+  return(c(rct=tau_hat[["rct"]] - mean(with(df,
+                                     as.vector(-s*z*(1-p_hat)*(1-r_hat)*d11_hat*(y-m11_hat)/(p_hat*e) -
+                                        s*(1-z)*(1-p_hat)*(1-r_hat)*d10_hat*(y-m10_hat)/(p_hat*(1-e)) -
+                                        (1-s)*z*(1-r_hat)*d01_hat*(y-m01_hat)/r_hat +
+                                        (1-s)*(1-z)*(y-m00_hat))*h_hat_rct)),
+           obs=tau_hat[["obs"]] - mean(with(df,
+                                     as.vector(-s*z*(1-p_hat)*(1-r_hat)*d11_hat*(y-m11_hat)/(p_hat*e) -
+                                        s*(1-z)*(1-p_hat)*(1-r_hat)*d10_hat*(y-m10_hat)/(p_hat*(1-e)) -
+                                        (1-s)*z*(1-r_hat)*d01_hat*(y-m01_hat)/r_hat +
+                                        (1-s)*(1-z)*(y-m00_hat))*h_hat_obs)),
+           tgt=tau_hat[["tgt"]] - mean(with(df,
+                                     as.vector(-s*z*(1-p_hat)*(1-r_hat)*d11_hat*(y-m11_hat)/(p_hat*e) -
+                                        s*(1-z)*(1-p_hat)*(1-r_hat)*d10_hat*(y-m10_hat)/(p_hat*(1-e)) -
+                                        (1-s)*z*(1-r_hat)*d01_hat*(y-m01_hat)/r_hat +
+                                        (1-s)*(1-z)*(y-m00_hat))*h_hat_tgt))))
+}
+```
+
+# Main simulation functions
+
+```{r}
+# Run single simulation
+run_single_sim <- function(estimand, x_type, n_rct, n_obs, p0, p1, 
+                           a0, a1, beta0, beta1, beta2, beta3, beta4, beta5, 
+                           K, x_in, CV_adj=NULL, CV_adj_oracle=NULL,
+                           n_replicates=NULL, seed=NULL) {
+  
+  ## Set seed
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
+  
+  ## Generate data
+  rct_df <- gen_data(x_type=x_type, n=n_rct, a0=a0, a1=a1, beta0=beta0, 
+                       beta1=beta1, beta2=beta2, beta3=beta3, beta4=beta4, 
+                       beta5=beta5)
+  obs_df <- gen_data(x_type=x_type, n=4*n_obs, a0=a0, a1=a1, beta0=beta0, 
+                       beta1=beta1, beta2=beta2, beta3=beta3, beta4=beta4, 
+                       beta5=beta5)
+  
+  ## Subject obs_df to selection
+  obs_sel_ind <- integer(0)
+  while (length(obs_sel_ind) < n_obs) {
+    obs_sel_ind <- filter_outcomes(y=obs_df$y, p0=p0, p1=p1)
+  }
+  obs_df <- obs_df[sample(obs_sel_ind, size=n_obs),]
+  
+  ## Combine experimental and observational data into single dataframe
+  df <- rbind(rct_df, obs_df)
+  df$s <- c(rep(1, nrow(rct_df)), rep(0, nrow(obs_df)))
+  df$e <- e_fun(X=df[,X_NAMES], a0=a0, a1=a1) # add known propensity
+  
+  ## Nonparametric baseline
+  df_aug <- add_nuisance_estimates(df=df, x_type=x_type, K=K, seed=seed)
+  tau_hats_baseline <- compute_baseline_estimators(df_aug)
+  
+  ## Oracle version of nonparametric baseline
+  N <- n_rct + n_obs
+  df_oracle <- add_true_nuisance_functions(df=df, x_type=x_type,
+                                           p0=p0, p1=p1, a0=a0, a1=a1,
+                                           beta0=beta0, beta1=beta1,
+                                           beta2=beta2, beta3=beta3, 
+                                           beta4=beta4, beta5=beta5)
+  tau_hats_baseline_oracle <- compute_baseline_estimators(df_oracle)
+  
+  ## Control variates estimator
+  ## Estimate adjustment via bootstrap if CV_adj is NULL
+  if (is.null(CV_adj)) {
+    if (is.null(x_in) && x_type=="continuous") {
+      x_in <- df[sample(nrow(df), size=50, replace=FALSE), X_NAMES]
+    }
+    CV_adj <- get_CV_adj_boot(df=df, n_replicates=n_replicates, K=K, 
+                              x_type=x_type, x_in=x_in, seed=seed)
+  }
+  if (is.null(CV_adj_oracle)) {
+    CV_adj_oracle <- get_CV_adj_boot(df=df_oracle, n_replicates=n_replicates, K=K, 
+                                     x_type=x_type, x_in=x_in, seed=seed)    
+  }
+  cv_estimates <- get_CV_estimates(df=df, x_in=x_in, seed=seed)
+  tau_hat_cv <- (tau_hats_baseline - CV_adj %*% cv_estimates)[,1]
+  tau_hat_cv_oracle <- (tau_hats_baseline_oracle - CV_adj_oracle %*% cv_estimates)[,1]
+  
+  ## Efficient estimator
+  tau_hats_eff <- compute_eff_estimators(df_aug)
+  tau_hats_eff_oracle <- compute_eff_estimators(df_oracle)
+  
+  return(list(rct=c(baseline=tau_hats_baseline[["rct"]], 
+                    baseline_oracle=tau_hats_baseline_oracle[["rct"]],
+                    cv=tau_hat_cv[["rct"]], 
+                    cv_oracle=tau_hat_cv_oracle[["rct"]],
+                    eff=tau_hats_eff[["rct"]], 
+                    eff_oracle=tau_hats_eff_oracle[["rct"]]),
+              obs=c(baseline=tau_hats_baseline[["obs"]], 
+                    baseline_oracle=tau_hats_baseline_oracle[["obs"]],
+                    cv=tau_hat_cv[["obs"]], 
+                    cv_oracle=tau_hat_cv_oracle[["obs"]],
+                    eff=tau_hats_eff[["obs"]], 
+                    eff_oracle=tau_hats_eff_oracle[["obs"]]),
+              tgt=c(baseline=tau_hats_baseline[["tgt"]], 
+                    baseline_oracle=tau_hats_baseline_oracle[["tgt"]],
+                    cv=tau_hat_cv[["tgt"]], 
+                    cv_oracle=tau_hat_cv_oracle[["tgt"]],
+                    eff=tau_hats_eff[["tgt"]], 
+                    eff_oracle=tau_hats_eff_oracle[["tgt"]]),
+              CV_adj=CV_adj, CV_adj_oracle=CV_adj_oracle, x_in=x_in))
+}
+```
+
+```{r}
+run_sims <- function(x_type, n_sims, n_rct, n_obs, p0, p1, n_replicates,
+                     a0, a1, beta0, beta1, beta2, beta3, beta4, beta5,
+                     K, n_input, init_seed=NULL) {
+  
+  tau_hats_rct <- matrix(NA, nrow=n_sims, ncol=6)
+  tau_hats_obs <- matrix(NA, nrow=n_sims, ncol=6)
+  tau_hats_tgt <- matrix(NA, nrow=n_sims, ncol=6)
+  
+  ## Run single sim to estimate optimal adjustment factors for CV estimator 
+  set.seed(init_seed)
+  if (x_type == "discrete") {
+    x_in <- NULL
+  } else if (x_type == "continuous") {
+    x_in <- gen_data(x_type=x_type, n=n_input, a0=a0, a1=a1, beta0=beta0, 
+                     beta1=beta1, beta2=beta2, beta3=beta3, beta4=beta4, 
+                     beta5=beta5)[,X_NAMES]
+  } else {
+    stop("x_type must be 'discrete' or 'continuous'")
+  }
+  first_sim_adj <- run_single_sim(x_type=x_type, n_rct=n_rct, n_obs=n_obs, 
+                                  p0=p0, p1=p1, a0=a0, a1=a1, beta0=beta0, 
+                                  beta1=beta1, beta2=beta2, beta3=beta3, 
+                                  beta4=beta4, beta5=beta5, K=K,
+                                  CV_adj=NULL, CV_adj_oracle=NULL, 
+                                  n_replicates=n_replicates, x_in=NULL,
+                                  seed=init_seed)
+  
+  CV_adj <- first_sim_adj$CV_adj
+  CV_adj_oracle <- first_sim_adj$CV_adj_oracle
+  
+  ## Run simulations  
+  for (sim in 1:n_sims) {
+    if (sim %% 50 == 0) {
+      print(paste("Simulation", sim, "out of", n_sims))
+    }
+    if (is.null(init_seed)) {
+      seed <- NULL
+    } else {
+      seed <- init_seed + sim + 1
+    }
+    sim_out <- run_single_sim(x_type=x_type, 
+                              n_rct=n_rct, n_obs=n_obs, p0=p0, p1=p1, 
+                              a0=a0, a1=a1, beta0=beta0, beta1=beta1, 
+                              beta2=beta2, beta3=beta3, beta4=beta4, 
+                              beta5=beta5, K=K, x_in=first_sim_adj$x_in, 
+                              CV_adj=CV_adj, CV_adj_oracle=CV_adj_oracle, seed=seed)
+    tau_hats_rct[sim,] <- sim_out$rct
+    tau_hats_obs[sim,] <- sim_out$obs
+    tau_hats_tgt[sim,] <- sim_out$tgt
+  }
+  colnames(tau_hats_rct) <- names(sim_out$rct)
+  colnames(tau_hats_obs) <- names(sim_out$obs)
+  colnames(tau_hats_tgt) <- names(sim_out$tgt)
+  return(list(rct_estimators=tau_hats_rct,
+              obs_estimators=tau_hats_obs,
+              tgt_estimators=tau_hats_tgt,
+              params=list(x_type=x_type, n_sims=n_sims, 
+                          n_rct=n_rct, n_obs=n_obs, p0=p0, p1=p1, 
+                          n_replicates=n_replicates, a0=a0, a1=a1, beta0=beta0, 
+                          beta1=beta1, beta2=beta2, beta3=beta3, beta4=beta4, 
+                          beta5=beta5, K=K, x_in=x_in,
+                          CV_adj=CV_adj, CV_adj_oracle=CV_adj_oracle,
+                          init_seed=init_seed)))
+}
+```
+
+## Run discrete sims
+
+```{r}
+# Simulation parameters
+n_sims <- 1000
+n_obs <- 3000
+n_rct_list <- c(300, 600, 1000, 3000)
+p0 <- 0.1 
+p1 <- 0.9
+n_replicates <- 1000
+a0 <- 0
+a1 <- c(1,-1)
+beta0 <- -0.5
+beta1 <- 1
+beta2 <- c(1,-1)
+beta3 <- c(-2,2)
+beta4 <- 0
+beta5 <- 0
+K <- 1
+init_seed <- 1
+```
+
+```{r}
+# n_rct_sizes <- length(n_rct_list)
+# sims_disc <- vector("list", length=n_rct_sizes)
+# for (i in 1:n_rct_sizes) {
+#   n_rct <- n_rct_list[i]
+#   print(paste("n_rct =", n_rct))
+#   sims_disc[[i]] <- run_sims(x_type="discrete", n_sims=n_sims,
+#                         n_rct=n_rct, n_obs=n_obs, p0=p0, p1=p1,
+#                         n_replicates=n_replicates, a0=a0, a1=a1,
+#                         beta0=beta0, beta1=beta1, beta2=beta2, beta3=beta3,
+#                         beta4=beta4, beta5=beta5, K=K,
+#                         n_input=n_input, init_seed=1)
+# }
+```
+
+```{r}
+## Save simulation output
+# saveRDS(sims_disc, file=paste(DIR, "or_sims_disc", sep=""))
+```
+
+## Run continuous sims
+
+```{r}
+# Simulation parameters
+n_sims <- 10
+n_rct_list <- c(300, 600, 1000, 3000)
+n_obs <- 3000
+p0 <- 0.1
+p1 <- 0.9
+n_replicates <- 10
+a0 <- 0
+a1 <- c(1,-1)
+beta0 <- -0.5
+beta1 <- 1
+beta2 <- c(1,-1)
+beta3 <- c(-2,2)
+beta4 <- -1
+beta5 <- 1.5
+K <- 5
+n_input <- 50
+init_seed <- 1
+```
+
+```{r}
+# n_rct_sizes <- length(n_rct_list)
+# sims_cont <- vector("list", length=n_rct_sizes)
+# for (i in 1:n_rct_sizes) {
+#   n_rct <- n_rct_list[i]
+#   print(paste("n_rct =", n_rct))
+#   sims_cont[[i]] <- run_sims(x_type="continuous", n_sims=n_sims,
+#                              n_rct=n_rct, n_obs=n_obs, p0=p0, p1=p1,
+#                              n_replicates=n_replicates, a0=a0, a1=a1,
+#                              beta0=beta0, beta1=beta1, beta2=beta2, beta3=beta3,
+#                              beta4=beta4, beta5=beta5, K=K,
+#                              n_input=n_input, init_seed=1)
+# }
+```
+
+```{r}
+# saveRDS(sims_cont, file=paste(DIR, "or_sims_cont", sep=""))
+```
+
+# Print and plot results
+
+```{r}
+## Read in saved sim data
+sims_disc <- readRDS(paste(DIR, "or_sims_disc", sep=""))
+sims_cont <- readRDS(paste(DIR, "or_sims_cont", sep=""))
+```
+
+```{r}
+# Compute true estimands
+get_estimands <- function(x_type, a0, a1, beta0, beta1, beta2, beta3, beta4, 
+                          beta5, p0, p1, rho) {
+  ## Create integrands
+  cate_integrand <- function(X) {
+    cate_fun(X=X, beta0=beta0, beta1=beta1, beta2=beta2, beta3=beta3,
+             beta4=beta4, beta5=beta5)
+  }
+  sel_prob_integrand <- function(X) {
+    selection_prob_given_X(X=X, a0=a0, a1=a1, beta0=beta0, beta1=beta1, 
+                           beta2=beta2, beta3=beta3, beta4=beta4, beta5=beta5,
+                           p0=p0, p1=p1)
+  }
+  if (x_type == "discrete") {
+    all_X <- matrix(c(0,0,0,1,1,0,1,1), ncol=2, byrow=TRUE)
+    selection_probs <- sel_prob_integrand(all_X)
+    x_dist_obs <- selection_probs / sum(selection_probs)
+    n_X <- nrow(all_X)
+    x_dist_tgt <- rho * rep(1/n_X, n_X) + (1-rho) * x_dist_obs
+    tau <- list(rct=mean(cate_integrand(all_X)),
+                obs=sum(x_dist_obs * cate_integrand(all_X)),
+                tgt=sum(x_dist_tgt * cate_integrand(all_X)))
+  } else if (x_type == "continuous") {
+    select_prob <- marginal_selection_prob(x_type=x_type, a0=a0, a1=a1, 
+                                           beta0=beta0, beta1=beta1, 
+                                           beta2=beta2, beta3=beta3,
+                                           beta4=beta4, beta5=beta5,
+                                           p0=p0, p1=p1)
+    inner_integral_rct <- function(x2) {
+      sapply(x2, function(x) integrate(function(x1) {
+          X_input <- cbind(x1, rep(x, length(x1)))
+          return(cate_integrand(X_input)*dunif(x1, min=-1, max=1)*
+                   dunif(x, min=-1, max=1))
+        }, lower=-1, upper=1, rel.tol=.Machine$double.eps^0.5)$value)
+    }
+    inner_integral_obs <- function(x2) {
+      sapply(x2, function(x) integrate(function(x1) {
+          X_input <- cbind(x1, rep(x, length(x1)))
+          return(cate_integrand(X_input)*dunif(x1, min=-1, max=1)*
+                   dunif(x, min=-1, max=1)*sel_prob_integrand(X_input)/select_prob)
+        }, lower=-1, upper=1, rel.tol=.Machine$double.eps^0.5)$value)
+    }
+    inner_integral_tgt <- function(x2) {
+      sapply(x2, function(x) integrate(function(x1) {
+          X_input <- cbind(x1, rep(x, length(x1)))
+          return(cate_integrand(X_input)*dunif(x1, min=-1, max=1)*
+                   dunif(x, min=-1, max=1)*(rho+(1-rho)*sel_prob_integrand(X_input)/select_prob))
+        }, lower=-1, upper=1, rel.tol=.Machine$double.eps^0.5)$value)
+    }
+    tau <- list(rct=integrate(inner_integral_rct, lower=-Inf, upper=Inf, 
+                              rel.tol=.Machine$double.eps^0.5)$value,
+                obs=integrate(inner_integral_obs, lower=-Inf, upper=Inf, 
+                              rel.tol=.Machine$double.eps^0.5)$value,
+                tgt=integrate(inner_integral_tgt, lower=-Inf, upper=Inf, 
+                              rel.tol=.Machine$double.eps^0.5)$value)
+  } else {
+    stop("x_type must be 'discrete' or 'continuous'")
+  }
+  return(tau)
+}
+```
+
+
+```{r}
+# Bootstrap CI's of relative efficiencies
+# Assumes first column of estimators is the baseline
+rel_eff_boot <- function(estimators, tau, boot_seed, alpha=0.05, B=10000) {
+  set.seed(boot_seed)
+  n <- nrow(estimators)
+  bias_sq_raw <- (colMeans(estimators) - tau)^2
+  var_raw <- apply(estimators, MARGIN=2, var)
+  mse_raw <- bias_sq_raw + var_raw
+  bias_sq_star <- bias_sq_raw[1] / bias_sq_raw[-1]
+  var_star <- var_raw[1] / var_raw[-1]
+  mse_star <- mse_raw[1] / mse_raw[-1]
+  bias_sq_boot <- matrix(NA, B, ncol=ncol(estimators)-1)
+  var_boot <- matrix(NA, B, ncol=ncol(estimators)-1)
+  mse_boot <- matrix(NA, B, ncol=ncol(estimators)-1)
+  for (b in 1:B) {
+    boot_est <- estimators[sample(n, n, replace=TRUE),]
+    bias_sq_list <- (colMeans(boot_est) - tau)^2
+    var_list <- apply(boot_est, MARGIN=2, var)
+    mse_list <- bias_sq_list + var_list
+    bias_sq_boot[b,] <- bias_sq_list[1] / bias_sq_list[-1]
+    var_boot[b,] <- var_list[1] / var_list[-1]
+    mse_boot[b,] <- mse_list[1] / mse_list[-1]
+  }
+  return(list(bias_sq=rbind(bias_sq_star,
+                            2*bias_sq_star - apply(bias_sq_boot, 2, quantile, 1-alpha/2),
+                            2*bias_sq_star - apply(bias_sq_boot, 2, quantile, alpha/2)),
+              var=rbind(var_star,
+                        2*var_star - apply(var_boot, 2, quantile, 1-alpha/2),
+                        2*var_star - apply(var_boot, 2, quantile, alpha/2)),
+              mse=rbind(mse_star,
+                        2*mse_star - apply(mse_boot, 2, quantile, 1-alpha/2),
+                        2*mse_star - apply(mse_boot, 2, quantile, alpha/2))))
+}
+```
+
+```{r}
+## Plots MSE, squared bias, and variance 
+plot_sims <- function(sim_out_list, estimand, titles=TRUE, xaxl=TRUE) {
+  all_names <- c("baseline", "baseline_oracle", "cv", "cv_oracle", "eff", 
+                 "eff_oracle")
+  plot_names <- c("ba", "ba_O", "cv", "cv_O", "eff", "eff_O")
+  n_sims <- length(sim_out_list)
+  param_list <- vector("list", length=n_sims)
+  estimand_list <- vector("list", length=n_sims)
+  bias_sq_est <- vector("list", length=n_sims)
+  var_est <- vector("list", length=n_sims)
+  mse_est <- vector("list", length=n_sims)
+  boot_out <- vector("list", length=n_sims)
+  boot_out_oracle <- vector("list", length=n_sims)
+  n_rct_list <- rep(NA, n_sims)
+  for (sim in 1:n_sims) {
+    sim_out <- sim_out_list[[sim]]
+    params <- sim_out$params
+    N <- params$n_rct + params$n_obs
+    rho <- params$n_rct / N
+    n_rct_list[sim] <- params$n_rct
+    tau <- get_estimands(x_type=params$x_type, 
+                         a0=params$a0, a1=params$a1, beta0=params$beta0, 
+                         beta1=params$beta1, beta2=params$beta2, 
+                         beta3=params$beta3, beta4=params$beta4,
+                         beta5=params$beta5, p0=params$p0, 
+                         p1=params$p1, rho=rho)[[estimand]]
+    estimators <- sim_out[[paste(estimand, "estimators", sep="_")]][,all_names]
+    boot_out[[sim]] <- rel_eff_boot(estimators=estimators[,-grep("_oracle", all_names, fixed=TRUE)], 
+                                    tau=tau, boot_seed=2024)
+    boot_out_oracle[[sim]] <- rel_eff_boot(estimators=estimators[,grep("_oracle", all_names, fixed=TRUE)], 
+                                           tau=tau, boot_seed=2024)
+    bias_sq_est[[sim]] <- (colMeans(estimators) - tau)^2
+    var_est[[sim]] <- apply(estimators, MARGIN=2, var)
+    mse_est[[sim]] <- bias_sq_est[[sim]] + var_est[[sim]]
+  }
+  
+  ## Compute MSE, variance, and squared bias
+  bias_sq_df <- as.data.frame(do.call("rbind", bias_sq_est), n_rct=n_rct_list)
+  var_df <- as.data.frame(do.call("rbind", var_est))
+  mse_df <- as.data.frame(do.call("rbind", mse_est))
+  colnames(bias_sq_df) <- plot_names
+  colnames(var_df) <- plot_names
+  colnames(mse_df) <- plot_names
+  
+  ## Plot MSE, variance, and squared bias
+  par(mfrow=c(1,3))
+  colors <- c("black", "black", "blue", "blue", "orange", "orange")
+  linetypes <- c("solid", "dashed", "solid", "dashed", "solid", "dashed")
+  linewidths <- c(2, 1, 2, 1, 2, 1)
+  max_y <- 1.1 * max(mse_df)
+  plot(n_rct_list, mse_df[,1], xlab=ifelse(xaxl, "n_rct", ""), ylab="", 
+       type="b", main=ifelse(titles, "MSE", ""),
+       col=colors[1], lty=linetypes[1], lwd=linewidths[1], ylim=c(0, max_y))
+  for (i in 2:length(plot_names)) {
+    name <- plot_names[i]
+    lines(n_rct_list, mse_df[[name]], col=colors[i], type="b", lwd=linewidths[i],
+          lty=linetypes[i])
+  }
+  plot(n_rct_list, var_df[,1], xlab=ifelse(xaxl, "n_rct", ""), ylab="", 
+       type="b", main=ifelse(titles, "Variance", ""),
+       col=colors[1], lty=linetypes[1], lwd=linewidths[1], ylim=c(0, max_y))
+  for (i in 2:length(plot_names)) {
+    name <- plot_names[i]
+    lines(n_rct_list, var_df[[name]], col=colors[i], type="b", lwd=linewidths[i],
+          lty=linetypes[i])
+  }
+  plot(n_rct_list, bias_sq_df[,1], xlab=ifelse(xaxl, "n_rct", ""), ylab="", 
+       type="b", main=ifelse(titles, "Squared bias", ""),
+       col=colors[1], lty=linetypes[1], lwd=linewidths[1], ylim=c(0, max_y))
+  for (i in 2:length(plot_names)) {
+    name <- plot_names[i]
+    lines(n_rct_list, bias_sq_df[[name]], col=colors[i], type="b", lwd=linewidths[i],
+          lty=linetypes[i])
+  }
+  legend(x="topright", legend=plot_names, col=colors, lty=linetypes)
+  
+  # Print relative efficiencies
+  point_ests <- t(sapply(boot_out, function(x) x$mse[1,]))
+  lowers <- t(sapply(boot_out, function(x) x$mse[2,]))
+  uppers <- t(sapply(boot_out, function(x) x$mse[3,]))
+  point_ests_oracle <- t(sapply(boot_out_oracle, function(x) x$mse[1,]))
+  lowers_oracle <- t(sapply(boot_out_oracle, function(x) x$mse[2,]))
+  uppers_oracle <- t(sapply(boot_out_oracle, function(x) x$mse[3,]))
+  
+  print("Relative efficiencies [95% CI]:")
+  print(round(point_ests, 2))
+  print(round(lowers, 2))
+  print(round(uppers, 2))
+  
+  print("Oracle relative efficiencies [95% CI]:")
+  print(round(point_ests_oracle, 2))
+  print(round(lowers_oracle, 2))
+  print(round(uppers_oracle, 2))
+}
+```
+
+```{r}
+png(paste(DIR, "outcome_bias_disc_rct.png", sep=""), width=6, height=3, 
+     units="in", res=300)
+plot_sims(sims_disc, estimand="rct", titles=TRUE, xaxl=FALSE)
+```
+
+```{r}
+png(paste(DIR, "outcome_bias_disc_obs.png", sep=""), width=6, height=3, 
+     units="in", res=300)
+plot_sims(sims_disc, estimand="obs", titles=TRUE, xaxl=TRUE)
+```
+
+```{r}
+png(paste(DIR, "outcome_bias_disc_tgt.png", sep=""), width=6, height=3, 
+     units="in", res=300)
+plot_sims(sims_disc, estimand="tgt", titles=FALSE, xaxl=TRUE)
+```
+
+```{r}
+png(paste(DIR, "outcome_bias_cont_rct.png", sep=""), width=6, height=3, 
+     units="in", res=300)
+plot_sims(sims_cont, estimand="rct", titles=TRUE, xaxl=FALSE)
+```
+
+```{r}
+png(paste(DIR, "outcome_bias_cont_obs.png", sep=""), width=6, height=3, 
+     units="in", res=300)
+plot_sims(sims_cont, estimand="obs", titles=TRUE, xaxl=TRUE)
+```
+
+```{r}
+png(paste(DIR, "outcome_bias_cont_tgt.png", sep=""), width=6, height=3, 
+     units="in", res=300)
+plot_sims(sims_cont, estimand="tgt", titles=FALSE, xaxl=TRUE)
+```
+
+
