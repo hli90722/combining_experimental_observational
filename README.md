@@ -2,7 +2,7 @@ This repository contains the code needed to reproduce the simulation and data re
 
 There are a total of four .Rmd files giving the main code for the two simulation settings and the two data examples.
 
-The chunks running the simulations can be uncommented to re-run the simulations, though for convenience (the simulations take several hours to run) the output of those sims has also been provided.
+The chunks running the simulations can be uncommented to re-run the simulations, though for convenience (the simulations take several hours to run) the RDS output of those sims has also been provided.
 
 The .csv files used in the data examples are also included for reference.
 
