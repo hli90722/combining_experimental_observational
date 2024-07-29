@@ -1,4 +1,4 @@
-This file contains the code needed to reproduce the simulation and data results in Section 4 of "Efficient combination of observational and experimental datasets under structural assumptions on outcome mean functions."
+This repository contains the code needed to reproduce the simulation and data results in Section 4 of "Efficient combination of observational and experimental datasets under structural assumptions on outcome mean functions."
 
 There are a total of four .Rmd files giving the main code for the two simulation settings and the two data examples.
 
