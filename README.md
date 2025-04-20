@@ -1,10 +1,8 @@
-This repository contains the code needed to reproduce the simulation and data results in Section 4 of "Efficient combination of observational and experimental datasets under structural assumptions on outcome mean functions."
+This repository contains the code needed to reproduce the simulation and data results in Sections 5 and 6 of "Efficient estimation and data fusion under general semiparametric restrictions on outcome mean functions"
 
-There are a total of four .Rmd files giving the main code for the two simulation settings and the two data examples.
+There are a total of two .Rmd files giving the main code for the simulations and data example.
 
-The chunks running the simulations can be uncommented to re-run the simulations, though for convenience (the simulations take several hours to run) the RDS output of those sims has also been provided.
+The chunks running the simulations can be uncommented to re-run the simulations, though for convenience the RDS output of those sims has also been provided.
 
 The .csv files used in the data examples are also included for reference.
-
-Please contact Harrison at hli90722 "at" stanford "dot" edu with any questions or concerns.
 
